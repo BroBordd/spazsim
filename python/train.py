@@ -1,6 +1,6 @@
 """PPO trainer (numpy only). Continuously checkpoints to a 'brain' file; rerun to resume, like an LLM run."""
 import argparse, os, signal, time, json, numpy as np
-from spazenv import SpazEnv, OBS_DIM, ACT_DIM
+from spazenv import SpazEnv, OBS_DIM, ACT_DIM, MAPS, PROBE_R, N_PROBE_DIRS, DT
 
 H = 128
 def init_mlp(rng, sizes, last_scale=0.01):
@@ -41,9 +41,19 @@ class RunNorm:
         self.var = (self.var * self.n + bv * bn + d ** 2 * self.n * bn / tot) / tot; self.n = tot
     def __call__(self, x): return np.clip((x - self.mean) / np.sqrt(self.var + 1e-8), -10, 10).astype(np.float32)
 
+def make_meta(map_name):
+    m = MAPS[map_name]
+    return dict(format=2, map=map_name, game_map=m["game_map"], boxes=m["boxes"], floor_top=0.0, repeat=4, dt=DT, max_steps=600,
+                obs_dim=OBS_DIM, act_dim=ACT_DIM, hidden=H, probe_dirs=N_PROBE_DIRS, probe_radii=list(PROBE_R), sim="spazsim",
+                note="boxes are game-xz coordinates, y relative to floor top; observations use only in-game node attributes")
+
+def peek_meta(path):
+    z = np.load(path, allow_pickle=False)
+    return json.loads(bytes(z["meta"]).decode()) if "meta" in z.files else None
+
 def save_brain(path, st):
     tmp = path + ".tmp.npz"
-    d = {"cfg": json.dumps(st["cfg"]), "iter": st["iter"], "steps": st["steps"], "best": st["best"], "log_std": st["log_std"],
+    d = {"cfg": json.dumps(st["cfg"]), "meta": np.frombuffer(json.dumps(st["meta"]).encode(), np.uint8), "iter": st["iter"], "steps": st["steps"], "best": st["best"], "log_std": st["log_std"],
          "norm_mean": st["norm"].mean, "norm_var": st["norm"].var, "norm_n": st["norm"].n, "adam_t": st["opt"].t,
          "rng": json.dumps(st["rng"].bit_generator.state)}
     for tag, P in (("pi", st["pi"]), ("vf", st["vf"])):
@@ -64,17 +74,21 @@ def load_brain(path, st):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--brain", default="brain.npz"); ap.add_argument("--map", default="holes")
+    ap.add_argument("--brain", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "brains", "the_pad.npz")); ap.add_argument("--map", default=None, help="training map (default: the brain's map, else the_pad)")
     ap.add_argument("--envs", type=int, default=32); ap.add_argument("--rollout", type=int, default=128)
     ap.add_argument("--lr", type=float, default=3e-4); ap.add_argument("--save_every", type=int, default=5)
     ap.add_argument("--iters", type=int, default=0, help="0 = run until interrupted")
     ap.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
     rng = np.random.default_rng(a.seed)
+    old = peek_meta(a.brain) if os.path.exists(a.brain) else None
+    if os.path.exists(a.brain) and old is None: raise SystemExit("brain has no metadata (old format); delete it or retrain")
+    if old and a.map and a.map != old["map"]: raise SystemExit(f"brain was trained on '{old['map']}', refusing to continue on '{a.map}'")
+    a.map = (old["map"] if old else a.map or "the_pad")
     pi = init_mlp(rng, [OBS_DIM, H, H, ACT_DIM]); vf = init_mlp(rng, [OBS_DIM, H, H, 1], 1.0)
     log_std = np.full(ACT_DIM, -0.5, np.float32)
     params = pi + vf + [log_std]; opt = Adam(params, a.lr)
-    st = dict(cfg=vars(a), iter=0, steps=0, best=-1e9, pi=pi, vf=vf, log_std=log_std, norm=RunNorm(OBS_DIM), opt=opt, rng=rng)
+    st = dict(cfg=vars(a), meta=make_meta(a.map), iter=0, steps=0, best=-1e9, pi=pi, vf=vf, log_std=log_std, norm=RunNorm(OBS_DIM), opt=opt, rng=rng)
     if os.path.exists(a.brain): load_brain(a.brain, st); print(f"resumed {a.brain}: iter {st['iter']}, {st['steps']} env steps")
     else: print("fresh brain")
     envs = [SpazEnv(a.map, seed=a.seed * 1000 + i + st["iter"]) for i in range(a.envs)]

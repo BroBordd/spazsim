@@ -15,7 +15,7 @@ class Sim:
     def reset(self, x, y, z, ang=0.0): _lib.ss_reset(self.h, x, y, z, ang)
     def step(self, lr, ud, run=0.0, jump=0): _lib.ss_step(self.h, lr, ud, run, int(jump))
     def state(self):
-        o = np.zeros(26, np.float32); _lib.ss_state(self.h, o.ctypes.data_as(fp)); return o
+        o = np.zeros(32, np.float32); _lib.ss_state(self.h, o.ctypes.data_as(fp)); return o
     def __del__(self):
         try: _lib.ss_destroy(self.h)
         except Exception: pass

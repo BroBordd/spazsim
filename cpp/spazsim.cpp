@@ -873,6 +873,9 @@ void ss_state(const Sim* s, float* o) {
   const Body* t = &s->bodies[B_TORSO]; const Body* r = &s->bodies[B_ROLLER]; const Body* h = &s->bodies[B_HEAD];
   for (int i = 0; i < 3; i++) { o[i] = t->pos[i]; o[3+i] = t->lvel[i]; o[6+i] = t->avel[i]; o[9+i] = t->Rm[4*i+1];
     o[12+i] = r->pos[i]; o[15+i] = r->lvel[i]; o[18+i] = h->pos[i]; }
+  { R prel[4] = {0.0f, 0.2f, -0.2f, 0}, f[4]; mul0_331(f, t->Rm, prel);   // position_forward: torso rel point (0,.2,-.2)
+    for (int i = 0; i < 3; i++) o[26+i] = f[i] + t->pos[i];
+    for (int i = 0; i < 3; i++) o[29+i] = t->pos[i] * 0.7f + h->pos[i] * 0.3f; }  // position_center
   o[21] = s->balance / 255.0f; o[22] = (float)s->footing; o[23] = (float)s->knockout; o[24] = s->run_gas; o[25] = s->ball_size;
 }
 }
