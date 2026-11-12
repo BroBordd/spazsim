@@ -38,3 +38,13 @@ Metadata: the trainer writes `meta` (map, game_map, boxes, repeat, dt, obs/act s
 continue a brain on a different map. Maps live in `spazenv.MAPS`; `the_pad` is an approximate footprint of The Pad
 (real collision meshes are not in the repo), `holes` is training-only. Tested offline (`test_plugin_equiv.py`):
 plugin obs/actions == trainer to ~1e-6, 20/20 closed-loop episodes survive. NOT tested inside a running game here.
+
+## Training speed / threading
+Everything per-step runs in C++ (`SpazPool`): sim stepping, observations, rewards, resets, on an OpenMP thread pool
+(`--threads N`, default all cores). Each env has its own RNG, so results are identical for any thread count
+(`tests/test_pool_equiv.py`). The PPO update shards each minibatch across threads (numpy, BLAS pinned to 1 thread per
+worker) and sums the gradients (`tests/test_grad_shards.py`). Measured on a 1-core box: ~2k -> ~24k samples/s
+(raw physics ~50k policy steps/s/core, so rollouts are at the physics limit). Multi-core scaling is expected to be
+near-linear for rollouts and good for the update but was NOT measured (the dev box had one core).
+Use many envs for many cores, e.g. `python3 train.py --envs 256 --threads 16`.
+`make hash` prints a fingerprint of the physics core (refactors must not change it on the same toolchain).

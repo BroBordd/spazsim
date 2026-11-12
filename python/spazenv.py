@@ -43,12 +43,13 @@ class SpazEnv:
         self.sim = Sim(self.boxes); self.repeat, self.max_steps = repeat, max_steps
         self.rng = np.random.default_rng(seed); self.reset()
 
-    def reset(self):
+    def reset(self, spawn=None):
         b = self.boxes
-        while True:  # spawn somewhere solid, away from edges
+        if spawn is not None: x, z, ang = spawn
+        while spawn is None:  # spawn somewhere solid, away from edges
             x = self.rng.uniform(self.cx - self.ext, self.cx + self.ext); z = self.rng.uniform(self.cz - self.ext, self.cz + self.ext)
             if all(on_floor(b, x + dx, z + dz) for dx in (-1, 0, 1) for dz in (-1, 0, 1)): break
-        self.sim.reset(float(x), -0.5, float(z), float(self.rng.uniform(0, 360)))
+        self.sim.reset(float(x), -0.5, float(z), float(self.rng.uniform(0, 360) if spawn is None else ang))
         self.t = 0; self.visited = set(); self.prev_act = np.zeros(4, np.float32)
         o = self.sim.state(); self.last = o; self.prev_up = None; self.prev_R = o[12:15].astype(np.float64)
         return self._obs(o)

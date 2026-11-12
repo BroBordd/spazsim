@@ -175,7 +175,7 @@ static bool invertPD(const R* A, R* Ainv) {
   return true;
 }
 // dRand (global LCG, seed saved/restored around each constraint shuffle)
-static uint64_t g_seed = 5432;
+static thread_local uint64_t g_seed = 5432;
 static uint64_t dRand() { g_seed = (1664525ULL * g_seed + 1013904223ULL) & 0xffffffffULL; return g_seed; }
 static int dRandInt(int n) { double a = double(n) / 4294967296.0; return (int)(double(dRand()) * a); }
 
@@ -370,7 +370,7 @@ struct IdxErr { int index; };
 
 static void sorLCP(int m, int nb, R* J, int* jb, Body** body, R* invI, R* fc, R* b, R* lo, R* hi,
                    R* cfm, int* findex, const World& w) {
-  (void)nb; std::vector<R> lambda(m, 0.0f), hicopy(hi, hi + m), iMJ((size_t)m * 12), Ad(m);
+  (void)nb; static thread_local std::vector<R> lambda, hicopy, iMJ, Ad; lambda.assign(m, 0.0f); hicopy.assign(hi, hi + m); iMJ.resize((size_t)m * 12); Ad.resize(m);
   for (int i = 0; i < m; i++) lambda[i] *= 0.9f;  // WARM_STARTING defined: lambda starts at 0
   // compute invM*J^T
   { R* ip = iMJ.data(); R* jp = J;
@@ -389,7 +389,7 @@ static void sorLCP(int m, int nb, R* J, int* jb, Body** body, R* invI, R* fc, R*
       ip += 12; jp += 12; Ad[i] = w.sor_w / (sum + cfm[i]); } }
   { R* jp = J; for (int i = 0; i < m; i++) { for (int j = 0; j < 12; j++) { jp[0] *= Ad[i]; jp++; } b[i] *= Ad[i]; } }
   for (int i = 0; i < m; i++) Ad[i] *= cfm[i];
-  std::vector<IdxErr> order(m); { int j = 0;
+  static thread_local std::vector<IdxErr> order; order.resize(m); { int j = 0;
     for (int i = 0; i < m; i++) if (findex[i] < 0) order[j++].index = i;
     for (int i = 0; i < m; i++) if (findex[i] >= 0) order[j++].index = i; }
   for (int it = 0; it < w.iters; it++) {
@@ -418,8 +418,8 @@ static void sorLCP(int m, int nb, R* J, int* jb, Body** body, R* invI, R* fc, R*
 static void quickStep(const World& w, Body** body, int nb, Joint** joint0, int nj) {
   R stepsize1 = 1.0f / kStep;
   for (int i = 0; i < nb; i++) body[i]->tag = i;
-  std::vector<Joint*> joint(joint0, joint0 + nj);
-  std::vector<R> invI((size_t)nb * 12);
+  static thread_local std::vector<Joint*> joint; joint.assign(joint0, joint0 + nj);
+  static thread_local std::vector<R> invI; invI.assign((size_t)nb * 12, 0.0f);
   for (int i = 0; i < nb; i++) {
     R tmp[12], I[12];
     mul2_333(tmp, body[i]->I, body[i]->Rm); mul0_333(I, body[i]->Rm, tmp);
@@ -428,13 +428,13 @@ static void quickStep(const World& w, Body** body, int nb, Joint** joint0, int n
   for (int i = 0; i < nb; i++) if (body[i]->gravity) {
     body[i]->facc[0] += body[i]->mass * w.gravity[0]; body[i]->facc[1] += body[i]->mass * w.gravity[1];
     body[i]->facc[2] += body[i]->mass * w.gravity[2]; }
-  std::vector<Info1> info(nj); int n2 = 0;
+  static thread_local std::vector<Info1> info; info.resize(nj); int n2 = 0;
   for (int j = 0; j < nj; j++) { getInfo1(joint[j], &info[n2]); if (info[n2].m > 0) { joint[n2] = joint[j]; n2++; } }
-  nj = n2; std::vector<int> ofs(nj); int m = 0;
+  nj = n2; static thread_local std::vector<int> ofs; ofs.resize(nj); int m = 0;
   for (int i = 0; i < nj; i++) { ofs[i] = m; m += info[i].m; }
   if (m > 0) {
-    std::vector<R> J((size_t)m * 12, 0.0f), c(m, 0.0f), cfm(m, kGlobalCFM), lo(m, -INF), hi(m, INF);
-    std::vector<int> findex(m, -1), jb((size_t)m * 2);
+    static thread_local std::vector<R> J, c, cfm, lo, hi; J.assign((size_t)m * 12, 0.0f); c.assign(m, 0.0f); cfm.assign(m, kGlobalCFM); lo.assign(m, -INF); hi.assign(m, INF);
+    static thread_local std::vector<int> findex, jb; findex.assign(m, -1); jb.resize((size_t)m * 2);
     Info2 ji; ji.rowskip = 12; ji.fps = stepsize1; ji.erp = 0.2f;
     for (int i = 0; i < nj; i++) {
       ji.J1l = &J[ofs[i] * 12]; ji.J1a = ji.J1l + 3; ji.J2l = ji.J1l + 6; ji.J2a = ji.J1l + 9;
@@ -447,7 +447,7 @@ static void quickStep(const World& w, Body** body, int nb, Joint** joint0, int n
         int b1 = joint[i]->node[0].body ? joint[i]->node[0].body->tag : -1;
         int b2 = joint[i]->node[1].body ? joint[i]->node[1].body->tag : -1;
         for (int j = 0; j < info[i].m; j++) { jp[0] = b1; jp[1] = b2; jp += 2; } } }
-    std::vector<R> tmp1((size_t)nb * 6), rhs(m);
+    static thread_local std::vector<R> tmp1, rhs; tmp1.resize((size_t)nb * 6); rhs.resize(m);
     for (int i = 0; i < nb; i++) {
       R inv = body[i]->invMass;
       for (int j = 0; j < 3; j++) tmp1[i * 6 + j] = body[i]->facc[j] * inv + body[i]->lvel[j] * stepsize1;
@@ -463,7 +463,7 @@ static void quickStep(const World& w, Body** body, int nb, Joint** joint0, int n
         jp += 6; rhs[i] = sum; } }
     for (int i = 0; i < m; i++) rhs[i] = c[i] * stepsize1 - rhs[i];
     for (int i = 0; i < m; i++) cfm[i] *= stepsize1;
-    std::vector<R> cforce((size_t)nb * 6);
+    static thread_local std::vector<R> cforce; cforce.resize((size_t)nb * 6);
     sorLCP(m, nb, J.data(), jb.data(), body, invI.data(), cforce.data(), rhs.data(), lo.data(), hi.data(),
            cfm.data(), findex.data(), w);
     for (int i = 0; i < nb; i++) {
@@ -485,7 +485,7 @@ static void quickStep(const World& w, Body** body, int nb, Joint** joint0, int n
 static void processIslands(const World& w, Body** allBodiesFirstToLast, int nbodies, std::vector<Joint*>& allJoints) {
   for (int i = 0; i < nbodies; i++) allBodiesFirstToLast[i]->tag = 0;
   for (Joint* j : allJoints) j->tag = 0;
-  std::vector<Body*> body(nbodies); std::vector<Joint*> joint(allJoints.size()); std::vector<Body*> stack(nbodies + 1);
+  static thread_local std::vector<Body*> body, stack; static thread_local std::vector<Joint*> joint; body.resize(nbodies); joint.resize(allJoints.size()); stack.resize(nbodies + 1);
   for (int bi = 0; bi < nbodies; bi++) {
     Body* bb = allBodiesFirstToLast[bi]; if (bb->tag) continue; bb->tag = 1;
     int stacksize = 0, bcount = 1, jcount = 0; Body* b = bb; body[0] = bb; bool quick = true;
@@ -601,7 +601,7 @@ struct Sim {
       setQuat(b, iq); memset(b->facc, 0, 16); memset(b->tacc, 0, 16); }
   }
   void reset(R x, R y, R z, R angle) {
-    *this = Sim(); build(); stand(x, y, z, angle);
+    std::vector<Box> m = std::move(map); *this = Sim(); map = std::move(m); build(); stand(x, y, z, angle);
   }
 
   // ---- terrain collision (analytic boxes; sphere-vs-box is ODE's exact algorithm) ----
@@ -846,7 +846,7 @@ struct Sim {
     footing = (roller_n > 0 ? 1 : 0) + (total_n > roller_n ? 1 : 0);
     { size_t k = 0; for (size_t i = 0; i < contacts.size(); i++) attach(&contacts[i], &bodies[contact_body[i]], nullptr); (void)k; }
     Body* list[5] = {&bodies[B_STAND], &bodies[B_ROLLER], &bodies[B_PELVIS], &bodies[B_TORSO], &bodies[B_HEAD]};  // newest first
-    std::vector<Joint*> all = alljoints; for (Joint& c : contacts) all.push_back(&c);
+    static thread_local std::vector<Joint*> all; all.assign(alljoints.begin(), alljoints.end()); for (Joint& c : contacts) all.push_back(&c);
     processIslands(world, list, 5, all);
     for (size_t i = contacts.size(); i-- > 0;) detachContact(&contacts[i]);
     steps_age++; stepnum++;
@@ -864,7 +864,7 @@ void ss_set_map(Sim* s, const float* boxes, int n) {  // n boxes of (minx,miny,m
   s->map.clear(); for (int i = 0; i < n; i++) { Box b; for (int k = 0; k < 3; k++) { b.mn[k] = boxes[i*6+k]; b.mx[k] = boxes[i*6+3+k]; } s->map.push_back(b); }
 }
 void ss_reset(Sim* s, float x, float y, float z, float angle) {
-  std::vector<Box> m = s->map; s->reset(x, y, z, angle); s->map = m;
+  s->reset(x, y, z, angle);
 }
 void ss_step(Sim* s, float lr, float ud, float run, int jump) { s->step(lr, ud, run, jump != 0); }
 // state: 0..2 torso pos, 3..5 torso vel, 6..8 torso avel, 9..11 torso up vector, 12..14 roller pos,
@@ -877,5 +877,119 @@ void ss_state(const Sim* s, float* o) {
     for (int i = 0; i < 3; i++) o[26+i] = f[i] + t->pos[i];
     for (int i = 0; i < 3; i++) o[29+i] = t->pos[i] * 0.7f + h->pos[i] * 0.3f; }  // position_center
   o[21] = s->balance / 255.0f; o[22] = (float)s->footing; o[23] = (float)s->knockout; o[24] = s->run_gas; o[25] = s->ball_size;
+}
+}
+
+// =================================================================================================
+// Multithreaded environment pool: sim stepping + observations + rewards + auto-reset, all in C++.
+// Per-env RNG => results are identical for any thread count.
+// =================================================================================================
+#include <unordered_set>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+namespace pool {
+static const int OBS_DIM = 58, NPROBE = 16;
+static const double DT_POLICY = 0.032;
+static const double kProbeR[2] = {1.5, 3.0};
+struct Rng {
+  uint64_t s;
+  uint64_t next() { uint64_t z = (s += 0x9E3779B97F4A7C15ULL); z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ULL; z = (z ^ (z >> 27)) * 0x94D049BB133111EBULL; return z ^ (z >> 31); }
+  double uni(double a, double b) { return a + (b - a) * ((next() >> 11) * (1.0 / 9007199254740992.0)); }
+};
+struct E {
+  Sim sim; Rng rng; int t = 0; std::unordered_set<int64_t> visited; double prev_up[3], prev_R[3]; bool have_prev = false; R prev_act[4] = {0, 0, 0, 0};
+};
+struct Pool {
+  int n, repeat, max_steps, threads; std::vector<Box> boxes; double cx, cz, ext; std::vector<E*> envs; double pdx[NPROBE], pdz[NPROBE];
+};
+static bool onFloor(const Pool* p, double x, double z) {
+  for (const Box& b : p->boxes) if (x >= b.mn[0] && x <= b.mx[0] && z >= b.mn[2] && z <= b.mx[2] && b.mx[1] >= -0.5) return true;
+  return false;
+}
+static void buildObs(const Pool* p, E* e, const R* st, float* out) {
+  double T[3], Rr[3], C[3], F[3], V[3];
+  for (int i = 0; i < 3; i++) { T[i] = st[i]; V[i] = st[3 + i]; Rr[i] = st[12 + i]; F[i] = st[26 + i]; C[i] = st[29 + i]; }
+  double up[3]; for (int i = 0; i < 3; i++) up[i] = (C[i] - 0.7 * T[i]) / 0.3 - T[i];
+  double n = sqrt(up[0] * up[0] + up[1] * up[1] + up[2] * up[2]);
+  if (n > 1e-6) { for (int i = 0; i < 3; i++) up[i] /= n; } else { up[0] = 0; up[1] = 1; up[2] = 0; }
+  if (!e->have_prev) { for (int i = 0; i < 3; i++) { e->prev_up[i] = up[i]; e->prev_R[i] = Rr[i]; } e->have_prev = true; }
+  int k = 0;
+  for (int i = 0; i < 3; i++) out[k++] = (float)up[i];
+  for (int i = 0; i < 3; i++) out[k++] = (float)((F[i] - T[i]) / 0.2);
+  for (int i = 0; i < 3; i++) out[k++] = (float)(V[i] / 5);
+  for (int i = 0; i < 3; i++) out[k++] = (float)(Rr[i] - T[i]);
+  for (int i = 0; i < 3; i++) out[k++] = (float)((up[i] - e->prev_up[i]) * 10);
+  for (int i = 0; i < 3; i++) out[k++] = (float)((Rr[i] - e->prev_R[i]) / DT_POLICY / 5);
+  out[k++] = (float)(T[1] - 0.0); out[k++] = st[23] > 0 ? 1.0f : 0.0f;
+  for (int i = 0; i < 4; i++) out[k++] = e->prev_act[i];
+  for (int r = 0; r < 2; r++) for (int d = 0; d < NPROBE; d++) out[k++] = onFloor(p, Rr[0] + p->pdx[d] * kProbeR[r], Rr[2] + p->pdz[d] * kProbeR[r]) ? 1.0f : -1.0f;
+  out[k++] = (float)((Rr[0] - p->cx) / p->ext); out[k++] = (float)((Rr[2] - p->cz) / p->ext);
+  for (int i = 0; i < 3; i++) { e->prev_up[i] = up[i]; e->prev_R[i] = Rr[i]; }
+}
+static void resetEnv(Pool* p, E* e, double x, double z, double ang, float* obs_out) {
+  e->sim.reset((R)x, -0.5f, (R)z, (R)ang); e->t = 0; e->visited.clear(); e->have_prev = false; for (int i = 0; i < 4; i++) e->prev_act[i] = 0;
+  R st[32]; ss_state(&e->sim, st); buildObs(p, e, st, obs_out);
+}
+static void randomSpawn(Pool* p, E* e, float* obs_out) {
+  double x = 0, z = 0;
+  for (int tries = 0; tries < 10000; tries++) {
+    x = e->rng.uni(p->cx - p->ext, p->cx + p->ext); z = e->rng.uni(p->cz - p->ext, p->cz + p->ext);
+    bool ok = true; for (int dx = -1; dx <= 1 && ok; dx++) for (int dz = -1; dz <= 1 && ok; dz++) ok = onFloor(p, x + dx, z + dz);
+    if (ok) break;
+  }
+  resetEnv(p, e, x, z, e->rng.uni(0, 360), obs_out);
+}
+}  // namespace pool
+
+extern "C" {
+void* sp_create(int n, const float* boxes, int nb, unsigned long long seed, int repeat, int max_steps, int threads) {
+  using namespace pool; Pool* p = new Pool(); p->n = n; p->repeat = repeat; p->max_steps = max_steps; p->threads = threads > 0 ? threads : 1;
+  double x0 = 1e30, x1 = -1e30, z0 = 1e30, z1 = -1e30;
+  for (int i = 0; i < nb; i++) { Box b; for (int k = 0; k < 3; k++) { b.mn[k] = boxes[i * 6 + k]; b.mx[k] = boxes[i * 6 + 3 + k]; } p->boxes.push_back(b);
+    x0 = std::min<double>(x0, b.mn[0]); x1 = std::max<double>(x1, b.mx[0]); z0 = std::min<double>(z0, b.mn[2]); z1 = std::max<double>(z1, b.mx[2]); }
+  p->cx = (x0 + x1) / 2; p->cz = (z0 + z1) / 2; p->ext = std::max(x1 - x0, z1 - z0) / 2;
+  for (int d = 0; d < NPROBE; d++) { double a = 2 * M_PI * d / NPROBE; p->pdx[d] = cos(a); p->pdz[d] = sin(a); }
+  for (int i = 0; i < n; i++) { E* e = new E(); e->sim.build(); e->sim.map = p->boxes; e->rng.s = seed * 1000003ULL + (unsigned long long)i * 7919ULL + 12345ULL; p->envs.push_back(e); }
+  return p;
+}
+void sp_destroy(void* vp) { pool::Pool* p = (pool::Pool*)vp; for (auto* e : p->envs) delete e; delete p; }
+void sp_reset_all(void* vp, float* obs) {
+  pool::Pool* p = (pool::Pool*)vp;
+#pragma omp parallel for schedule(static) num_threads(p->threads)
+  for (int i = 0; i < p->n; i++) pool::randomSpawn(p, p->envs[i], obs + (size_t)i * pool::OBS_DIM);
+}
+void sp_reset_one(void* vp, int i, float x, float z, float ang, float* obs) {  // deterministic spawn (tests)
+  pool::Pool* p = (pool::Pool*)vp; pool::resetEnv(p, p->envs[i], x, z, ang, obs);
+}
+// act: n*4. flags: 0 running, 1 fell, 2 downed, 3 truncated. final_obs written only for ended envs (terminal state).
+void sp_step(void* vp, const float* act, float* obs, float* rew, int* flags, int* cells, float* final_obs) {
+  using namespace pool; Pool* p = (Pool*)vp;
+#pragma omp parallel for schedule(static) num_threads(p->threads)
+  for (int i = 0; i < p->n; i++) {
+    E* e = p->envs[i]; const float* a = act + (size_t)i * 4;
+    float lr = std::max(-1.0f, std::min(1.0f, a[0])), ud = std::max(-1.0f, std::min(1.0f, a[1]));
+    float run = std::max(0.0f, std::min(1.0f, a[2])); bool jump = a[3] > 0.5f;
+    for (int k = 0; k < p->repeat; k++) e->sim.step(lr, ud, run, jump);
+    R o[32]; ss_state(&e->sim, o); e->t++;
+    e->prev_act[0] = lr; e->prev_act[1] = ud; e->prev_act[2] = run; e->prev_act[3] = jump ? 1.0f : 0.0f;
+    float r = 0.02f; int fl = 0;
+    int64_t key = ((int64_t)(int)floorf(o[0]) << 32) ^ (int64_t)(uint32_t)(int)floorf(o[2]);
+    if (e->visited.insert(key).second) r += 0.5f;
+    r += 0.01f * std::min(hypotf(o[3], o[5]), 5.0f);
+    if (o[1] < -1.5f) { r -= 20.0f; fl = 1; }
+    else if (o[23] > 0 || o[10] < 0.4f) { r -= 10.0f; fl = 2; }
+    else if (e->t >= p->max_steps) fl = 3;
+    rew[i] = r; flags[i] = fl; cells[i] = (int)e->visited.size();
+    if (fl) { buildObs(p, e, o, final_obs + (size_t)i * OBS_DIM); randomSpawn(p, e, obs + (size_t)i * OBS_DIM); }
+    else buildObs(p, e, o, obs + (size_t)i * OBS_DIM);
+  }
+}
+int sp_max_threads() {
+#ifdef _OPENMP
+  return omp_get_max_threads();
+#else
+  return 1;
+#endif
 }
 }

@@ -1,6 +1,11 @@
 """PPO trainer (numpy only). Continuously checkpoints to a 'brain' file; rerun to resume, like an LLM run."""
-import argparse, os, signal, time, json, numpy as np
-from spazenv import SpazEnv, OBS_DIM, ACT_DIM, MAPS, PROBE_R, N_PROBE_DIRS, DT
+import os
+for _v in ("OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS"): os.environ.setdefault(_v, "1")
+import argparse, signal, time, json
+from concurrent.futures import ThreadPoolExecutor
+import numpy as np
+from spazpool import SpazPool, max_threads
+from spazenv import OBS_DIM, ACT_DIM, MAPS, PROBE_R, N_PROBE_DIRS, DT
 
 H = 128
 def init_mlp(rng, sizes, last_scale=0.01):
@@ -41,6 +46,27 @@ class RunNorm:
         self.var = (self.var * self.n + bv * bn + d ** 2 * self.n * bn / tot) / tot; self.n = tot
     def __call__(self, x): return np.clip((x - self.mean) / np.sqrt(self.var + 1e-8), -10, 10).astype(np.float32)
 
+def shard_grads(pi, vf, log_std, x, ac, oldlp, ad, ret, m_total):
+    """PPO-clip + value gradients for one shard of a minibatch (summed contributions, normalized by the full minibatch)."""
+    mu, ca = mlp_fwd(pi, x); std = np.exp(log_std)
+    lp = (-0.5 * ((ac - mu) / std) ** 2 - log_std - 0.9189385).sum(1); ratio = np.exp(lp - oldlp)
+    clipped = ((ad > 0) & (ratio > 1.2)) | ((ad < 0) & (ratio < 0.8)); w = np.where(clipped, np.float32(0), ratio * ad)[:, None].astype(np.float32)
+    gmu = (-w * (ac - mu) / std ** 2 / m_total).astype(np.float32)
+    gls = (-(w * (((ac - mu) / std) ** 2 - 1.0)).sum(0) / m_total).astype(np.float32)
+    Gp = mlp_bwd(pi, ca, gmu)
+    v, cv = mlp_fwd(vf, x); gv = ((0.5 * (v[:, 0] - ret))[:, None] / m_total).astype(np.float32)
+    return Gp + mlp_bwd(vf, cv, gv) + [gls]
+
+def parallel_grads(ex, nthreads, pi, vf, log_std, x, ac, oldlp, ad, ret):
+    m = len(x); k = min(nthreads, max(1, m // 64)); cuts = np.linspace(0, m, k + 1).astype(int)
+    jobs = [(x[a:b], ac[a:b], oldlp[a:b], ad[a:b], ret[a:b]) for a, b in zip(cuts[:-1], cuts[1:])]
+    if k == 1: parts = [shard_grads(pi, vf, log_std, *jobs[0], m)]
+    else: parts = list(ex.map(lambda j: shard_grads(pi, vf, log_std, *j, m), jobs))
+    G = parts[0]
+    for p in parts[1:]: G = [g + h for g, h in zip(G, p)]
+    G[-1] = G[-1] - 0.001  # entropy bonus gradient (once per minibatch)
+    return G
+
 def make_meta(map_name):
     m = MAPS[map_name]
     return dict(format=2, map=map_name, game_map=m["game_map"], boxes=m["boxes"], floor_top=0.0, repeat=4, dt=DT, max_steps=600,
@@ -78,7 +104,7 @@ def main():
     ap.add_argument("--envs", type=int, default=32); ap.add_argument("--rollout", type=int, default=128)
     ap.add_argument("--lr", type=float, default=3e-4); ap.add_argument("--save_every", type=int, default=5)
     ap.add_argument("--iters", type=int, default=0, help="0 = run until interrupted")
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--seed", type=int, default=0); ap.add_argument("--threads", type=int, default=0, help="0 = all cores"); ap.add_argument("--minibatch", type=int, default=0, help="0 = max(1024, 256*threads)")
     a = ap.parse_args()
     rng = np.random.default_rng(a.seed)
     old = peek_meta(a.brain) if os.path.exists(a.brain) else None
@@ -91,30 +117,31 @@ def main():
     st = dict(cfg=vars(a), meta=make_meta(a.map), iter=0, steps=0, best=-1e9, pi=pi, vf=vf, log_std=log_std, norm=RunNorm(OBS_DIM), opt=opt, rng=rng)
     if os.path.exists(a.brain): load_brain(a.brain, st); print(f"resumed {a.brain}: iter {st['iter']}, {st['steps']} env steps")
     else: print("fresh brain")
-    envs = [SpazEnv(a.map, seed=a.seed * 1000 + i + st["iter"]) for i in range(a.envs)]
-    obs = np.stack([e.reset() for e in envs]); stop = [False]
+    pool = SpazPool(a.map, a.envs, seed=a.seed * 1000 + st["iter"], threads=a.threads)
+    obs = pool.reset(); stop = [False]
     signal.signal(signal.SIGINT, lambda *_: stop.__setitem__(0, True)); signal.signal(signal.SIGTERM, lambda *_: stop.__setitem__(0, True))
-    ep_ret = np.zeros(a.envs); recent = []; falls = []; cells = []
+    mb = a.minibatch or max(1024, 256 * pool.threads); ex = ThreadPoolExecutor(pool.threads)
+    print(f"{a.envs} envs on {pool.threads} threads (C++ pool), minibatch {mb}")
+    ep_ret = np.zeros(a.envs, np.float32); recent = []; falls = []; cells = []
     while not stop[0]:
         T, N = a.rollout, a.envs; t0 = time.time()
         O = np.zeros((T, N, OBS_DIM), np.float32); A = np.zeros((T, N, ACT_DIM), np.float32); LP = np.zeros((T, N), np.float32)
-        V = np.zeros((T + 1, N), np.float32); Rw = np.zeros((T, N), np.float32); D = np.zeros((T, N), np.float32); TR = np.zeros((T, N), np.float32)
-        raw_obs = []
+        V = np.zeros((T + 1, N), np.float32); Rw = np.zeros((T, N), np.float32); D = np.zeros((T, N), np.float32)
+        raw_obs = []; std = np.exp(log_std)
         for t in range(T):
             raw_obs.append(obs); n = st["norm"](obs); mu, _ = mlp_fwd(pi, n); v, _ = mlp_fwd(vf, n)
-            std = np.exp(log_std); act = mu + std * st["rng"].standard_normal(mu.shape).astype(np.float32)
+            act = mu + std * st["rng"].standard_normal(mu.shape).astype(np.float32)
             LP[t] = (-0.5 * ((act - mu) / std) ** 2 - log_std - 0.9189385).sum(1); O[t], A[t], V[t] = n, act, v[:, 0]
-            nobs = np.empty_like(obs)
-            for i, e in enumerate(envs):
-                o, r, d, tr, info = e.step(act[i]); Rw[t, i] = r; ep_ret[i] += r
-                if tr: TR[t, i] = 1; Rw[t, i] += 0.0
-                if d or tr:
-                    if tr:  # bootstrap truncated episodes with the value of the last state
-                        vv, _ = mlp_fwd(vf, st["norm"](o[None])); Rw[t, i] += 0.99 * vv[0, 0]
-                    D[t, i] = 1; recent.append(ep_ret[i]); falls.append(1.0 if info.get("fell") or info.get("downed") else 0.0); cells.append(info["cells"]); ep_ret[i] = 0; o = e.reset()
-                nobs[i] = o
-            obs = nobs
-        st["norm"].update(np.concatenate(raw_obs)); st["steps"] += T * N
+            obs, r, flags, ccount, final = pool.step(act)
+            Rw[t] = r; ep_ret += r; ended = flags > 0
+            if ended.any():
+                tr = flags == 3
+                if tr.any():  # bootstrap time-limit truncations with the value of the terminal state
+                    vv, _ = mlp_fwd(vf, st["norm"](final[tr])); Rw[t, tr] += 0.99 * vv[:, 0]
+                D[t, ended] = 1
+                recent += ep_ret[ended].tolist(); falls += ((flags[ended] == 1) | (flags[ended] == 2)).astype(np.float32).tolist(); cells += ccount[ended].tolist()
+                ep_ret[ended] = 0
+        t_roll = time.time() - t0; st["norm"].update(np.concatenate(raw_obs)); st["steps"] += T * N
         vlast, _ = mlp_fwd(vf, st["norm"](obs)); V[T] = vlast[:, 0]
         adv = np.zeros((T, N), np.float32); g = 0
         for t in reversed(range(T)):
@@ -124,20 +151,13 @@ def main():
         advf = (advf - advf.mean()) / (advf.std() + 1e-8); B = len(Of)
         for ep in range(4):
             perm = st["rng"].permutation(B)
-            for s in range(0, B, 1024):
-                ix = perm[s:s + 1024]; x, ac = Of[ix], Af[ix]
-                mu, ca = mlp_fwd(pi, x); std = np.exp(log_std)
-                lp = (-0.5 * ((ac - mu) / std) ** 2 - log_std - 0.9189385).sum(1); ratio = np.exp(lp - LPf[ix]); ad = advf[ix]
-                clipped = ((ad > 0) & (ratio > 1.2)) | ((ad < 0) & (ratio < 0.8)); w = np.where(clipped, 0.0, ratio * ad)[:, None]
-                gmu = -w * (ac - mu) / std ** 2 / len(ix)
-                gls = -(w * (((ac - mu) / std) ** 2 - 1.0)).sum(0) / len(ix) - 0.001
-                Gp = mlp_bwd(pi, ca, gmu.astype(np.float32))
-                v, cv = mlp_fwd(vf, x); gv = (0.5 * (v[:, 0] - retf[ix]))[:, None] * 2 / len(ix) * 0.5
-                Gv = mlp_bwd(vf, cv, gv.astype(np.float32))
-                opt.step(params, Gp + Gv + [gls.astype(np.float32)]); np.clip(log_std, -2.5, 0.5, out=log_std)
+            for s in range(0, B, mb):
+                ix = perm[s:s + mb]
+                G = parallel_grads(ex, pool.threads, pi, vf, log_std, Of[ix], Af[ix], LPf[ix], advf[ix], retf[ix])
+                opt.step(params, G); np.clip(log_std, -2.5, 0.5, out=log_std)
         st["iter"] += 1; mr = float(np.mean(recent[-50:])) if recent else 0.0
         if recent and mr > st["best"]: st["best"] = mr
-        print(f"iter {st['iter']:5d} steps {st['steps']:9d} ret {mr:7.2f} fail {np.mean(falls[-50:]) if falls else 0:4.2f} cells {np.mean(cells[-50:]) if cells else 0:5.1f} std {np.exp(log_std).mean():.2f} {T*N/(time.time()-t0):6.0f} sps", flush=True)
+        print(f"iter {st['iter']:5d} steps {st['steps']:9d} ret {mr:7.2f} fail {np.mean(falls[-50:]) if falls else 0:4.2f} cells {np.mean(cells[-50:]) if cells else 0:5.1f} std {np.exp(log_std).mean():.2f} {T*N/(time.time()-t0):6.0f} sps (rollout {t_roll*1000:.0f}ms, update {(time.time()-t0-t_roll)*1000:.0f}ms)", flush=True)
         if st["iter"] % a.save_every == 0: save_brain(a.brain, st)
         if a.iters and st["iter"] >= a.iters: break
     save_brain(a.brain, st); print("saved", a.brain)
